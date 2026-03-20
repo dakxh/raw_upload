@@ -1,0 +1,149 @@
+name: Raw Payload Downloader & HF Uploader
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  process-payload:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Free Up Disk Space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
+      - name: Install Dependencies
+        run: |
+          # Removed ffmpeg & guessit, keeping only core download/upload dependencies
+          sudo apt-get update && sudo apt-get install -y aria2 libcurl4-openssl-dev jq unzip
+          
+          pip install -U --break-system-packages "huggingface_hub[cli]" requests google-auth
+
+      - name: Fetch from Discord
+        id: discord_fetch
+        env:
+          DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+          CHANNEL_ID: ${{ secrets.DISCORD_CHANNEL_ID }}
+        run: |
+          g++ discord_manager.cpp -o discord_manager -lcurl
+          
+          OUTPUT=$(./discord_manager "$DISCORD_TOKEN" "$CHANNEL_ID" fetch)
+          MSG_ID=$(echo "$OUTPUT" | cut -d'|' -f1)
+          TARGET_LINK=$(echo "$OUTPUT" | cut -d'|' -f2-)
+          
+          if [ -z "$TARGET_LINK" ] || [ "$MSG_ID" == "empty" ] || [ "$MSG_ID" == "error" ]; then
+            echo "❌ Queue is empty or API Error."
+            echo "found=false" >> $GITHUB_ENV
+            exit 0
+          fi
+          
+          echo "🎯 Target acquired: $TARGET_LINK"
+          echo "MSG_ID=$MSG_ID" >> $GITHUB_ENV
+          echo "TARGET_LINK=$TARGET_LINK" >> $GITHUB_ENV
+          echo "found=true" >> $GITHUB_ENV
+
+      - name: Download Payload
+        if: env.found == 'true'
+        env:
+          GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
+        run: |
+          mkdir -p workspace
+          
+          if [[ "$TARGET_LINK" == *drive.google.com* ]] || [[ "$TARGET_LINK" == *drive.usercontent.google.com* ]]; then
+            if [[ "$TARGET_LINK" == *\&at=* ]] || [[ "$TARGET_LINK" == *confirm=t* ]]; then
+              cd workspace && curl -# -L -OJ "$TARGET_LINK" && cd ..
+            else
+              cat << 'EOF' > gdrive_sa_dl.py
+          import os, sys, re, json, requests
+          from google.oauth2 import service_account
+          from google.auth.transport.requests import Request
+          link = sys.argv[1]
+          sa_info = json.loads(os.environ.get('GCP_SA_JSON'))
+          creds = service_account.Credentials.from_service_account_info(sa_info, scopes=['https://www.googleapis.com/auth/drive.readonly'])
+          creds.refresh(Request())
+          headers = {'Authorization': f'Bearer {creds.token}'}
+          match = re.search(r'(id=|/d/|folders/)([a-zA-Z0-9_-]+)', link)
+          def download_file(fid, fname):
+              with requests.get(f"https://www.googleapis.com/drive/v3/files/{fid}?alt=media", headers=headers, stream=True) as r:
+                  r.raise_for_status()
+                  with open(os.path.join("workspace", fname), 'wb') as f:
+                      for chunk in r.iter_content(chunk_size=1024*1024*10):
+                          if chunk: f.write(chunk)
+          def process_node(fid):
+              res = requests.get(f"https://www.googleapis.com/drive/v3/files/{fid}?fields=name,mimeType", headers=headers).json()
+              if res.get('mimeType') == 'application/vnd.google-apps.folder':
+                  children = requests.get(f"https://www.googleapis.com/drive/v3/files?q='{fid}'+in+parents+and+trashed=false&fields=files(id,name,mimeType)", headers=headers).json().get('files',[])
+                  for child in children:
+                      if child['mimeType'] == 'application/vnd.google-apps.folder': process_node(child['id'])
+                      else: download_file(child['id'], child['name'])
+              else: download_file(fid, res['name'])
+          process_node(match.group(2))
+          EOF
+              python3 gdrive_sa_dl.py "$TARGET_LINK"
+            fi
+          elif [[ "$TARGET_LINK" == http* ]]; then
+            curl -s -L -o "workspace/payload.torrent" "$TARGET_LINK"
+            aria2c --bt-stop-timeout=600 --timeout=600 --seed-time=0 "workspace/payload.torrent" -d workspace/
+          else
+            aria2c --bt-stop-timeout=600 --timeout=600 --seed-time=0 --bt-save-metadata=true "$TARGET_LINK" -d workspace/
+          fi
+          
+          # Extract any Zips inside the payload
+          while read -u 9 ZIP_FILE; do unzip -q -o "$ZIP_FILE" -d workspace/; rm "$ZIP_FILE"; done 9< <(find workspace -type f -name "*.zip")
+          
+          # Cleanup torrent and aria2 artifacts before uploading
+          rm -f workspace/*.torrent workspace/*.aria2 || true
+
+      - name: Sync Raw Payload to Storage Bucket
+        if: env.found == 'true'
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+          HF_BUCKET: ${{ secrets.HF_BUCKET }}
+        run: |
+          python3 -c "
+          import os
+          from huggingface_hub import login, sync_bucket
+          token = os.environ.get('HF_TOKEN')
+          bucket = os.environ.get('HF_BUCKET')
+          msg_id = os.environ.get('MSG_ID')
+          
+          print('🚀 Authenticating Hugging Face SDK...')
+          login(token=token)
+          
+          print('⚡ Initiating Raw Storage Bucket sync...')
+          # Uploads contents of workspace/ into a specific folder tracked by Discord MSG_ID
+          sync_bucket('./workspace', f'hf://buckets/{bucket}/downloads/{msg_id}')
+          "
+          
+          echo "✅ Raw Bucket Sync completed successfully."
+
+      - name: Report Status to Discord
+        if: always() && env.found == 'true'
+        env:
+          DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
+          QUEUE_CH: ${{ secrets.DISCORD_CHANNEL_ID }}
+          PING_CH: ${{ secrets.DISCORD_PING_CHANNEL_ID }}
+        run: |
+          if [ "${{ job.status }}" == "success" ]; then
+            TOTAL_SIZE=$(du -sh workspace | cut -f1)
+            ./discord_manager "$DISCORD_TOKEN" "$QUEUE_CH" delete "$MSG_ID"
+            ./discord_manager "$DISCORD_TOKEN" "$PING_CH" send "✅ **Raw Download & Bucket Sync Complete!** \n📦 Payload Size: \`${TOTAL_SIZE}\`\n📁 Uploaded to folder: \`downloads/${MSG_ID}\` via CDN."
+          else
+            PAYLOAD=$(jq -n --arg c "❌ **Raw Pipeline Failed!** \n🔗[View Logs](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})" '{content: $c}')
+            curl -s -H "Authorization: Bot $DISCORD_TOKEN" -H "Content-Type: application/json" -X POST -d "$PAYLOAD" "https://discord.com/api/v10/channels/$PING_CH/messages"
+          fi
