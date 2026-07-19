@@ -1,4 +1,4 @@
-name: Raw Payload Downloader & HF Uploader
+name: Raw Payload Downloader & HF Uploader (Native Engine)
 
 on:
   workflow_dispatch:
@@ -16,12 +16,28 @@ jobs:
         with:
           fetch-depth: 1
 
+      - name: Free Up Disk Space
+        uses: jlumbroso/free-disk-space@main
+        with:
+          tool-cache: false
+          android: true
+          dotnet: true
+          haskell: true
+          large-packages: true
+          docker-images: true
+          swap-storage: true
+
       - name: Install Dependencies
         run: |
-          # Removed ffmpeg & guessit, keeping only core download/upload dependencies
-          sudo apt-get update && sudo apt-get install -y aria2 libcurl4-openssl-dev jq unzip
+          # Add Cloudflare official repository for WARP
+          curl -fsSL https://pkg.cloudflareclient.com/pubkey.gpg | sudo gpg --yes --dearmor --output /usr/share/keyrings/cloudflare-warp-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/cloudflare-warp-archive-keyring.gpg] https://pkg.cloudflareclient.com/ $(lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/cloudflare-client.list
           
-          pip install -U --break-system-packages "huggingface_hub[cli]" requests google-auth
+          # Install core download/upload and extraction dependencies
+          sudo apt-get update && sudo apt-get install -y libcurl4-openssl-dev jq unzip unrar cloudflare-warp ffmpeg
+          
+          # Install Python dependencies including tqdm for GDrive visual progress
+          pip install -U --break-system-packages "huggingface_hub[cli]" requests google-auth tqdm
 
       - name: Fetch from Discord
         id: discord_fetch
@@ -46,57 +62,163 @@ jobs:
           echo "TARGET_LINK=$TARGET_LINK" >> $GITHUB_ENV
           echo "found=true" >> $GITHUB_ENV
 
-      - name: Download Payload
+      - name: Download and Extract Payload
         if: env.found == 'true'
         env:
           GCP_SA_JSON: ${{ secrets.GCP_SA_JSON }}
         run: |
           mkdir -p workspace
-          
+          echo "Evaluating Payload Type..."
+
+          # --- GLOBAL WARP INITIALIZATION ---
+          echo "🌐 Initializing Cloudflare WARP Proxy globally..."
+          warp-cli --accept-tos registration new
+          warp-cli --accept-tos mode proxy
+          warp-cli --accept-tos connect
+
+          echo "⏳ Waiting for WARP connection to stabilize..."
+          for i in {1..12}; do
+            if curl -s -x socks5://127.0.0.1:40000 https://cloudflare.com/cdn-cgi/trace | grep -q "warp=on"; then
+              echo "✅ WARP Proxy successfully established."
+              break
+            fi
+            echo "Retrying WARP check ($i/12)..."
+            sleep 5
+          done
+
+          # --- ROUTING ENGINE ---
+          IS_TORRENT=false
+          if [[ "$TARGET_LINK" == magnet:* ]] || [[ "$TARGET_LINK" == *.torrent* ]]; then
+            IS_TORRENT=true
+          fi
+
           if [[ "$TARGET_LINK" == *drive.google.com* ]] || [[ "$TARGET_LINK" == *drive.usercontent.google.com* ]]; then
+            # --- BRANCH 1: GOOGLE DRIVE ---
             if [[ "$TARGET_LINK" == *\&at=* ]] || [[ "$TARGET_LINK" == *confirm=t* ]]; then
+              echo "🚀 Detected Pre-Authenticated Direct Drive Link."
               cd workspace && curl -# -L -OJ "$TARGET_LINK" && cd ..
             else
+              echo "🌐 Detected Standard Google Drive Link. Initializing Lightning SA Downloader..."
               cat << 'EOF' > gdrive_sa_dl.py
           import os, sys, re, json, requests
           from google.oauth2 import service_account
           from google.auth.transport.requests import Request
-          link = sys.argv[1]
-          sa_info = json.loads(os.environ.get('GCP_SA_JSON'))
+          from tqdm import tqdm
+          link, sa_json_str = sys.argv[1], os.environ.get('GCP_SA_JSON')
+          if not sa_json_str: sys.exit(1)
+          sa_info = json.loads(sa_json_str)
           creds = service_account.Credentials.from_service_account_info(sa_info, scopes=['https://www.googleapis.com/auth/drive.readonly'])
           creds.refresh(Request())
           headers = {'Authorization': f'Bearer {creds.token}'}
           match = re.search(r'(id=|/d/|folders/)([a-zA-Z0-9_-]+)', link)
+          file_id = match.group(2)
           def download_file(fid, fname):
-              with requests.get(f"https://www.googleapis.com/drive/v3/files/{fid}?alt=media", headers=headers, stream=True) as r:
-                  r.raise_for_status()
+              url = f"https://www.googleapis.com/drive/v3/files/{fid}?alt=media"
+              with requests.get(url, headers=headers, stream=True) as r:
+                  total_size = int(r.headers.get('Content-Length', 0))
                   with open(os.path.join("workspace", fname), 'wb') as f:
-                      for chunk in r.iter_content(chunk_size=1024*1024*10):
-                          if chunk: f.write(chunk)
+                      with tqdm(total=total_size, unit='iB', unit_scale=True, desc=fname[:30], ascii=True) as pbar:
+                          for chunk in r.iter_content(chunk_size=1024*1024*10):
+                              if chunk: f.write(chunk); pbar.update(len(chunk))
           def process_node(fid):
               res = requests.get(f"https://www.googleapis.com/drive/v3/files/{fid}?fields=name,mimeType", headers=headers).json()
               if res.get('mimeType') == 'application/vnd.google-apps.folder':
-                  children = requests.get(f"https://www.googleapis.com/drive/v3/files?q='{fid}'+in+parents+and+trashed=false&fields=files(id,name,mimeType)", headers=headers).json().get('files',[])
-                  for child in children:
-                      if child['mimeType'] == 'application/vnd.google-apps.folder': process_node(child['id'])
-                      else: download_file(child['id'], child['name'])
+                  children = requests.get(f"https://www.googleapis.com/drive/v3/files?q='{fid}'+in+parents+and+trashed=false", headers=headers).json().get('files', [])
+                  for child in children: process_node(child['id'])
               else: download_file(fid, res['name'])
-          process_node(match.group(2))
+          process_node(file_id)
           EOF
               python3 gdrive_sa_dl.py "$TARGET_LINK"
             fi
-          elif [[ "$TARGET_LINK" == http* ]]; then
-            curl -s -L -o "workspace/payload.torrent" "$TARGET_LINK"
-            aria2c --bt-stop-timeout=600 --timeout=600 --seed-time=0 "workspace/payload.torrent" -d workspace/
+
+          elif [[ "$IS_TORRENT" == "false" ]] && [[ "$TARGET_LINK" == http* ]]; then
+            # --- BRANCH 2: DIRECT HTTP (yt-dlp) ---
+            echo "📎 Detected Direct HTTP Link. Using Global WARP Proxy..."
+            HEADERS=$(curl -g -sIL -x socks5h://127.0.0.1:40000 -H 'User-Agent: Mozilla/5.0' "$TARGET_LINK" || true)
+            SERVER_FILENAME=$(python3 -c "import sys, re, urllib.parse; h=sys.stdin.read(); m=re.search(r'(?i)filename\*?=(?:\"?UTF-8\'\'\"?)?([^\r\n;]+)', h); print(urllib.parse.unquote(m.group(1).strip(' \"\'')) if m else 'Direct_Payload.mkv')" <<< "$HEADERS")
+            
+            wget -qO yt-dlp https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp_linux && chmod +x yt-dlp
+            ./yt-dlp --proxy "socks5://127.0.0.1:40000" --add-header 'User-Agent: Mozilla/5.0' -N 16 -o "workspace/$SERVER_FILENAME" "$TARGET_LINK"
+
           else
-            aria2c --bt-stop-timeout=600 --timeout=600 --seed-time=0 --bt-save-metadata=true "$TARGET_LINK" -d workspace/
+            # --- BRANCH 3: TORRENT ENGINE (Magnet or .torrent) ---
+            echo "🧲 Torrent Source Detected. Configuring Aggressive Cloud Engine..."
+            wget -qO qbittorrent-nox https://github.com/userdocs/qbittorrent-nox-static/releases/latest/download/x86_64-qbittorrent-nox
+            chmod +x qbittorrent-nox
+            mkdir -p ~/.config/qBittorrent
+            
+            cat << EOF_CONF > ~/.config/qBittorrent/qBittorrent.conf
+          [Preferences]
+          WebUI\Port=8085
+          WebUI\AuthSubnetWhitelistEnabled=true
+          WebUI\AuthSubnetWhitelist=127.0.0.1/32, ::1/128
+          WebUI\LocalHostAuth=false
+          Downloads\SavePath=$(pwd)/workspace/
+          # Aggressive NAT piercing & Proxy forcing
+          BitTorrent\Session\MaxConnections=500
+          BitTorrent\Session\Encryption=1
+          BitTorrent\Session\DHT=true
+          BitTorrent\Session\PeX=true
+          BitTorrent\Session\LSD=false
+          Network\Port=443
+          Proxy\Type=2
+          Proxy\IP=127.0.0.1
+          Proxy\Port=40000
+          Proxy\Enabled=true
+          Proxy\PeerExchange=true
+          Proxy\OnlyForTorrents=false
+          EOF_CONF
+
+            ./qbittorrent-nox -d --confirm-legal-notice
+            
+            cat << 'EOF_PY' > qbit_monitor.py
+          import time, requests, sys
+          target_link, base_url = sys.argv[1], "http://127.0.0.1:8085/api/v2"
+          def log(m): print(m, flush=True)
+          for _ in range(30):
+              try: 
+                  requests.get(f"{base_url}/app/version"); break
+              except: time.sleep(1)
+          res = requests.post(f"{base_url}/torrents/add", data={'urls': target_link})
+          log("📡 Torrent added. Waiting for peers...")
+          last_p, start_t, last_log = -1, time.time(), 0
+          while True:
+              try:
+                  torrents = requests.get(f"{base_url}/torrents/info").json()
+                  if not torrents: 
+                      if time.time() - start_t > 60: sys.exit(1)
+                      time.sleep(2); continue
+                  t = torrents[0]
+                  state, progress = t.get('state'), t.get('progress', 0)
+                  speed = t.get('dlspeed', 0) / (1024*1024)
+                  if progress > last_p: start_t, last_p = time.time(), progress
+                  if time.time() - last_log >= 10:
+                      log(f"🔄 [{state.upper()}] | {progress*100:.2f}% | {speed:.2f} MB/s | Seeds: {t.get('num_seeds')} | Peers: {t.get('num_leechs')}")
+                      last_log = time.time()
+                  if progress == 1.0 or state in ['uploading', 'stalledUP', 'queuedUP']: break
+                  if time.time() - start_t > 600: 
+                      log("❌ Stalled for 10m. Check peer availability or .torrent file health."); sys.exit(1)
+                  time.sleep(2)
+              except Exception as e: time.sleep(2)
+          EOF_PY
+            python3 qbit_monitor.py "$TARGET_LINK"
+            curl -s -X POST http://127.0.0.1:8085/api/v2/app/shutdown || true
+            rm qbittorrent-nox
           fi
-          
-          # Extract any Zips inside the payload
-          while read -u 9 ZIP_FILE; do unzip -q -o "$ZIP_FILE" -d workspace/; rm "$ZIP_FILE"; done 9< <(find workspace -type f -name "*.zip")
-          
-          # Cleanup torrent and aria2 artifacts before uploading
-          rm -f workspace/*.torrent workspace/*.aria2 || true
+
+          echo "🛑 Disconnecting WARP Proxy..."
+          warp-cli --accept-tos disconnect || true
+
+          # --- EXTRACTION ENGINE ---
+          echo "🔍 Processing archives..."
+          find workspace -type f -name "*.zip" -exec unzip -q -o {} -d workspace/ \; -exec rm {} \;
+          while read -u 9 RAR; do
+            echo "📦 Extracting: $RAR"
+            unrar e -y "$RAR" workspace/ || true
+            DIR=$(dirname "$RAR")
+            rm -f "$DIR"/*.rar "$DIR"/*.r[0-9][0-9] "$DIR"/*.s[0-9][0-9] "$DIR"/*.sfv "$DIR"/*.nfo
+            rm -rf "$DIR/Sample" || true
+          done 9< <(find workspace -type f -name "*.rar")
 
       - name: Sync Raw Payload to Storage Bucket
         if: env.found == 'true'
