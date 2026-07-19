@@ -2,6 +2,11 @@ name: Raw Payload Downloader & HF Uploader (Native Engine)
 
 on:
   workflow_dispatch:
+    inputs:
+      target_link:
+        description: 'Manual Target Link (Leave empty to fetch from Discord)'
+        required: false
+        type: string
 
 permissions:
   contents: write
@@ -39,28 +44,37 @@ jobs:
           # Install Python dependencies including tqdm for GDrive visual progress
           pip install -U --break-system-packages "huggingface_hub[cli]" requests google-auth tqdm
 
-      - name: Fetch from Discord
-        id: discord_fetch
+      - name: Fetch Target Link (Manual or Discord)
+        id: fetch_target
         env:
           DISCORD_TOKEN: ${{ secrets.DISCORD_TOKEN }}
           CHANNEL_ID: ${{ secrets.DISCORD_CHANNEL_ID }}
+          MANUAL_LINK: ${{ inputs.target_link }}
         run: |
-          g++ discord_manager.cpp -o discord_manager -lcurl
-          
-          OUTPUT=$(./discord_manager "$DISCORD_TOKEN" "$CHANNEL_ID" fetch)
-          MSG_ID=$(echo "$OUTPUT" | cut -d'|' -f1)
-          TARGET_LINK=$(echo "$OUTPUT" | cut -d'|' -f2-)
-          
-          if [ -z "$TARGET_LINK" ] || [ "$MSG_ID" == "empty" ] || [ "$MSG_ID" == "error" ]; then
-            echo "❌ Queue is empty or API Error."
-            echo "found=false" >> $GITHUB_ENV
-            exit 0
+          if [ -n "$MANUAL_LINK" ]; then
+            echo "🎯 Manual Target acquired: $MANUAL_LINK"
+            echo "MSG_ID=manual_${{ github.run_id }}" >> $GITHUB_ENV
+            echo "TARGET_LINK=$MANUAL_LINK" >> $GITHUB_ENV
+            echo "found=true" >> $GITHUB_ENV
+          else
+            echo "📡 No manual input. Fetching from Discord queue..."
+            g++ discord_manager.cpp -o discord_manager -lcurl
+            
+            OUTPUT=$(./discord_manager "$DISCORD_TOKEN" "$CHANNEL_ID" fetch)
+            MSG_ID=$(echo "$OUTPUT" | cut -d'|' -f1)
+            TARGET_LINK=$(echo "$OUTPUT" | cut -d'|' -f2-)
+            
+            if [ -z "$TARGET_LINK" ] || [ "$MSG_ID" == "empty" ] || [ "$MSG_ID" == "error" ]; then
+              echo "❌ Queue is empty or API Error."
+              echo "found=false" >> $GITHUB_ENV
+              exit 0
+            fi
+            
+            echo "🎯 Discord Target acquired: $TARGET_LINK"
+            echo "MSG_ID=$MSG_ID" >> $GITHUB_ENV
+            echo "TARGET_LINK=$TARGET_LINK" >> $GITHUB_ENV
+            echo "found=true" >> $GITHUB_ENV
           fi
-          
-          echo "🎯 Target acquired: $TARGET_LINK"
-          echo "MSG_ID=$MSG_ID" >> $GITHUB_ENV
-          echo "TARGET_LINK=$TARGET_LINK" >> $GITHUB_ENV
-          echo "found=true" >> $GITHUB_ENV
 
       - name: Download and Extract Payload
         if: env.found == 'true'
@@ -252,7 +266,9 @@ jobs:
         run: |
           if [ "${{ job.status }}" == "success" ]; then
             TOTAL_SIZE=$(du -sh workspace | cut -f1)
-            ./discord_manager "$DISCORD_TOKEN" "$QUEUE_CH" delete "$MSG_ID"
+            if [[ ! "$MSG_ID" == manual_* ]]; then
+              ./discord_manager "$DISCORD_TOKEN" "$QUEUE_CH" delete "$MSG_ID"
+            fi
             ./discord_manager "$DISCORD_TOKEN" "$PING_CH" send "✅ **Raw Download & Bucket Sync Complete!** \n📦 Payload Size: \`${TOTAL_SIZE}\`\n📁 Uploaded to folder: \`downloads/${MSG_ID}\` via CDN."
           else
             PAYLOAD=$(jq -n --arg c "❌ **Raw Pipeline Failed!** \n🔗[View Logs](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID})" '{content: $c}')
